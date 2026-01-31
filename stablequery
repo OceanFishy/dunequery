@@ -1,0 +1,113 @@
+WITH market_metadata AS (
+
+    -- Get human-readable names for the markets
+
+    SELECT id, 
+
+           marketParams
+
+    FROM morpho_blue_ethereum.morphoblue_evt_createmarket
+
+),
+
+
+
+raw_flows AS (
+
+    -- Aggregate all historical supply and borrow actions to track pool state
+
+    SELECT evt_block_time, id, assets as amount, 'supply' as type FROM morpho_blue_ethereum.morphoblue_evt_supply
+
+    UNION ALL
+
+    SELECT evt_block_time, id, -assets as amount, 'supply' as type FROM morpho_blue_ethereum.morphoblue_evt_withdraw
+
+    UNION ALL
+
+    SELECT evt_block_time, id, assets as amount, 'borrow' as type FROM morpho_blue_ethereum.morphoblue_evt_borrow
+
+    UNION ALL
+
+    SELECT evt_block_time, id, -assets as amount, 'borrow' as type FROM morpho_blue_ethereum.morphoblue_evt_repay
+
+),
+
+
+
+state_calc AS (
+
+    -- Calculate rolling Total Supply and Total Borrow per market
+
+    SELECT 
+
+        evt_block_time,
+
+        id,
+
+        SUM(CASE WHEN type = 'supply' THEN amount ELSE 0 END) OVER (PARTITION BY id ORDER BY evt_block_time) as total_supply,
+
+        SUM(CASE WHEN type = 'borrow' THEN amount ELSE 0 END) OVER (PARTITION BY id ORDER BY evt_block_time) as total_borrow
+
+    FROM raw_flows
+
+),
+
+
+
+withdrawals AS (
+
+    -- Isolate the specific withdrawal events we want to audit
+
+    SELECT 
+
+        w.evt_block_time,
+
+        w.evt_tx_hash,
+
+        w.id,
+
+        w.assets / 1e18 as withdrawn_amount,
+
+        w.onBehalf as curator_address,
+
+        s.total_supply / 1e18 as supply_before,
+
+        s.total_borrow / 1e18 as borrow_before
+
+    FROM morpho_blue_ethereum.morphoblue_evt_withdraw w
+
+    JOIN state_calc s ON w.evt_block_time = s.evt_block_time AND w.id = s.id
+
+)
+
+
+
+SELECT 
+
+    evt_block_time,
+
+    id as market_id,
+
+    withdrawn_amount,
+
+    (borrow_before / supply_before) * 100 as utilization_before,
+
+    (borrow_before / (supply_before - withdrawn_amount)) * 100 as utilization_after,
+
+    CASE 
+
+        WHEN (borrow_before / supply_before) < 0.9 AND (borrow_before / (supply_before - withdrawn_amount)) >= 0.9 
+
+        THEN '⚠️ SQUEEZE EVENT' 
+
+        ELSE 'Normal Rebalance' 
+
+    END as behavior_flag
+
+FROM withdrawals
+
+WHERE supply_before > 0
+
+ORDER BY evt_block_time DESC
+
+LIMIT 100
