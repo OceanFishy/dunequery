@@ -1,0 +1,66 @@
+WITH market_metadata AS (
+    SELECT 
+        id as market_id, 
+        from_hex(json_value(marketParams, 'lax $.loanToken')) as loan_token_address
+    FROM morpho_blue_ethereum.morphoblue_evt_createmarket
+),
+
+-- 1. Aggregate all flows with evt_index for deterministic ordering
+raw_flows AS (
+    SELECT evt_block_time, evt_index, id, assets as amount, 'supply' as type FROM morpho_blue_ethereum.morphoblue_evt_supply
+    UNION ALL
+    SELECT evt_block_time, evt_index, id, -assets as amount, 'supply' as type FROM morpho_blue_ethereum.morphoblue_evt_withdraw
+    UNION ALL
+    SELECT evt_block_time, evt_index, id, assets as amount, 'borrow' as type FROM morpho_blue_ethereum.morphoblue_evt_borrow
+    UNION ALL
+    SELECT evt_block_time, evt_index, id, -assets as amount, 'borrow' as type FROM morpho_blue_ethereum.morphoblue_evt_repay
+),
+
+-- 2. Calculate running totals per market ID
+state_calc AS (
+    SELECT 
+        evt_block_time,
+        evt_index,
+        id,
+        SUM(CASE WHEN type = 'supply' THEN amount ELSE 0 END) OVER (PARTITION BY id ORDER BY evt_block_time, evt_index) as total_supply,
+        SUM(CASE WHEN type = 'borrow' THEN amount ELSE 0 END) OVER (PARTITION BY id ORDER BY evt_block_time, evt_index) as total_borrow
+    FROM raw_flows
+),
+
+-- 3. Isolate withdrawals and fetch state immediately preceding the event
+withdrawals_processed AS (
+    SELECT 
+        w.evt_block_time,
+        w.id,
+        w.assets as raw_assets,
+        w.onBehalf as curator_address,
+        -- Fetch the totals from the state immediately BEFORE this row's update
+        LAG(s.total_supply) OVER (PARTITION BY w.id ORDER BY w.evt_block_time, w.evt_index) as supply_before,
+        LAG(s.total_borrow) OVER (PARTITION BY w.id ORDER BY w.evt_block_time, w.evt_index) as borrow_before
+    FROM morpho_blue_ethereum.morphoblue_evt_withdraw w
+    JOIN state_calc s ON w.id = s.id 
+        AND w.evt_block_time = s.evt_block_time 
+        AND w.evt_index = s.evt_index
+)
+
+SELECT 
+    w.evt_block_time as block_timestamp,
+    w.id as market_id,
+    t.symbol AS loan_asset,
+    cast(w.raw_assets as double) / power(10, t.decimals) as withdrawn_amount,
+    w.curator_address,
+    -- Utilization Before: (Borrow / Supply)
+    (cast(w.borrow_before as double) / NULLIF(cast(w.supply_before as double), 0)) * 100 as u_before,
+    -- Utilization After: (Borrow / (Supply - Withdrawn))
+    (cast(w.borrow_before as double) / NULLIF(cast(w.supply_before as double) - cast(w.raw_assets as double), 0)) * 100 as u_after,
+    CASE 
+        WHEN (cast(w.borrow_before as double) / NULLIF(cast(w.supply_before as double), 0)) * 100 < 90 
+             AND (cast(w.borrow_before as double) / NULLIF(cast(w.supply_before as double) - cast(w.raw_assets as double), 0)) * 100 >= 90 
+        THEN '⚠️ SQUEEZE' 
+        ELSE 'Normal' 
+    END as status
+FROM withdrawals_processed w
+LEFT JOIN market_metadata m ON w.id = m.market_id
+LEFT JOIN tokens_ethereum.erc20 t ON t.contract_address = m.loan_token_address
+WHERE w.supply_before > w.raw_assets
+ORDER BY w.evt_block_time DESC;
