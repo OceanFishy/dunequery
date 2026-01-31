@@ -1,0 +1,57 @@
+WITH market_metadata AS (
+    SELECT 
+        id as market_id, 
+        from_hex(json_value(marketParams, 'lax $.loanToken')) as loan_token_address
+    FROM morpho_blue_ethereum.morphoblue_evt_createmarket
+),
+
+-- Get the market state from the market() function call
+market_states AS (
+    SELECT 
+        call_block_time,
+        call_tx_hash,
+        _0 as market_id,
+        output_totalSupplyAssets,
+        output_totalBorrowAssets
+    FROM morpho_blue_ethereum.morphoblue_call_market
+    WHERE call_success = true
+),
+
+withdrawals_with_state AS (
+    SELECT 
+        w.evt_block_time as block_timestamp,
+        w.id as market_id,
+        w.assets as withdrawn_raw,
+        w.onBehalf as curator_address,
+        -- Join with market state from the same transaction
+        s.output_totalSupplyAssets as supply_at_event,
+        s.output_totalBorrowAssets as borrow_at_event
+    FROM morpho_blue_ethereum.morphoblue_evt_withdraw w
+    LEFT JOIN market_states s ON s.market_id = w.id 
+        AND s.call_tx_hash = w.evt_tx_hash
+        AND s.call_block_time <= w.evt_block_time
+)
+
+SELECT 
+    w.block_timestamp,
+    w.market_id,
+    t.symbol AS loan_asset,
+    cast(w.withdrawn_raw as double) / power(10, t.decimals) as withdrawn_amount,
+    
+    -- Utilization Before: Current Debt / Current Assets
+    (cast(w.borrow_at_event as double) / NULLIF(cast(w.supply_at_event as double), 0)) * 100 as u_before,
+    
+    -- Utilization After: Current Debt / (Current Assets - Withdrawn)
+    -- This shows how "squeezed" the liquidity became because of this specific withdrawal
+    (cast(w.borrow_at_event as double) / NULLIF(cast(w.supply_at_event as double) - cast(w.withdrawn_raw as double), 0)) * 100 as u_after,
+    
+    CASE 
+        WHEN (cast(w.borrow_at_event as double) / NULLIF(cast(w.supply_at_event as double) - cast(w.withdrawn_raw as double), 0)) * 100 > 99 THEN '🚨 CRITICAL SQUEEZE'
+        WHEN (cast(w.borrow_at_event as double) / NULLIF(cast(w.supply_at_event as double) - cast(w.withdrawn_raw as double), 0)) * 100 > 90 THEN '⚠️ SQUEEZE' 
+        ELSE 'Normal' 
+    END as status
+FROM withdrawals_with_state w
+LEFT JOIN market_metadata m ON w.market_id = m.market_id
+LEFT JOIN tokens_ethereum.erc20 t ON t.contract_address = m.loan_token_address
+WHERE w.supply_at_event > 0
+ORDER BY w.block_timestamp DESC
