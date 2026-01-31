@@ -1,0 +1,86 @@
+WITH market_metadata AS (
+    SELECT 
+        id as market_id, 
+        from_hex(json_value(marketParams, 'lax $.loanToken')) as loan_token_address
+    FROM morpho_blue_ethereum.morphoblue_evt_createmarket
+),
+
+-- 1. Aggregate ALL value-changing events, including Accrued Interest
+raw_flows AS (
+    -- User Supply: Increases Supply
+    SELECT evt_block_time, evt_index, id, assets as amount, 0 as debt_change, 'supply' as type FROM morpho_blue_ethereum.morphoblue_evt_supply
+    UNION ALL
+    -- User Withdraw: Decreases Supply
+    SELECT evt_block_time, evt_index, id, -assets as amount, 0 as debt_change, 'withdraw' as type FROM morpho_blue_ethereum.morphoblue_evt_withdraw
+    UNION ALL
+    -- User Borrow: Increases Debt
+    SELECT evt_block_time, evt_index, id, 0 as amount, assets as debt_change, 'borrow' as type FROM morpho_blue_ethereum.morphoblue_evt_borrow
+    UNION ALL
+    -- User Repay: Decreases Debt
+    SELECT evt_block_time, evt_index, id, 0 as amount, -assets as debt_change, 'repay' as type FROM morpho_blue_ethereum.morphoblue_evt_repay
+    UNION ALL
+    -- Interest Accrual: This is the "Fix". It increases BOTH Debt and Supply (as interest goes to suppliers)
+    -- We subtract feeShares logic conceptually here; for pure utilization, interest increases total debt.
+    SELECT 
+        evt_block_time, 
+        evt_index, 
+        id, 
+        interest as amount, 
+        interest as debt_change, 
+        'interest' as type 
+    FROM morpho_blue_ethereum.morphoblue_evt_accrueinterest
+),
+
+-- 2. Calculate running totals per market ID using deterministic ordering
+state_calc AS (
+    SELECT 
+        evt_block_time,
+        evt_index,
+        id,
+        -- Total Supply is the sum of all deposits/withdrawals + all interest earned
+        SUM(amount) OVER (PARTITION BY id ORDER BY evt_block_time, evt_index) as total_supply,
+        -- Total Borrow is the sum of all borrow/repay + all interest accrued
+        SUM(debt_change) OVER (PARTITION BY id ORDER BY evt_block_time, evt_index) as total_borrow
+    FROM raw_flows
+),
+
+-- 3. Isolate withdrawals and fetch state immediately preceding the event
+withdrawals_processed AS (
+    SELECT 
+        w.evt_block_time,
+        w.id,
+        w.assets as raw_assets,
+        w.onBehalf as curator_address,
+        -- LAG ensures we see the market state BEFORE the withdrawal happens
+        LAG(s.total_supply) OVER (PARTITION BY w.id ORDER BY w.evt_block_time, w.evt_index) as supply_before,
+        LAG(s.total_borrow) OVER (PARTITION BY w.id ORDER BY w.evt_block_time, w.evt_index) as borrow_before
+    FROM morpho_blue_ethereum.morphoblue_evt_withdraw w
+    INNER JOIN state_calc s ON w.id = s.id 
+        AND w.evt_block_time = s.evt_block_time 
+        AND w.evt_index = s.evt_index
+)
+
+SELECT 
+    w.evt_block_time as block_timestamp,
+    w.id as market_id,
+    t.symbol AS loan_asset,
+    cast(w.raw_assets as double) / power(10, t.decimals) as withdrawn_amount,
+    w.curator_address,
+    
+    -- Utilization Before: (Accrued Borrow / Accrued Supply)
+    (cast(w.borrow_before as double) / NULLIF(cast(w.supply_before as double), 0)) * 100 as u_before,
+    
+    -- Utilization After: (Accrued Borrow / (Accrued Supply - Withdrawn))
+    (cast(w.borrow_before as double) / NULLIF(cast(w.supply_before as double) - cast(w.raw_assets as double), 0)) * 100 as u_after,
+    
+    CASE 
+        WHEN (cast(w.borrow_before as double) / NULLIF(cast(w.supply_before as double), 0)) * 100 < 90 
+             AND (cast(w.borrow_before as double) / NULLIF(cast(w.supply_before as double) - cast(w.raw_assets as double), 0)) * 100 >= 90 
+        THEN '⚠️ SQUEEZE' 
+        ELSE 'Normal' 
+    END as status
+FROM withdrawals_processed w
+LEFT JOIN market_metadata m ON w.id = m.market_id
+LEFT JOIN tokens_ethereum.erc20 t ON t.contract_address = m.loan_token_address
+WHERE w.supply_before > w.raw_assets
+ORDER BY w.evt_block_time DESC;
